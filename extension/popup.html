@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {
+            width: 300px;
+            padding: 15px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        
+        h2 {
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            color: #333;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+        
+        .connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .disconnected {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .info {
+            font-size: 13px;
+            color: #666;
+            margin: 5px 0;
+        }
+        
+        .info span {
+            font-weight: bold;
+            color: #333;
+        }
+        
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        button:hover {
+            background: #45a049;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .footer {
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid #e0e0e0;
+            font-size: 11px;
+            color: #999;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h2>🎬 Drive Capture v2</h2>
+    
+    <div id="status" class="status disconnected">
+        Checking connection...
+    </div>
+    
+    <div class="info">
+        Active tabs: <span id="tabs">0</span>
+    </div>
+    
+    <div class="info">
+        Current job: <span id="job">None</span>
+    </div>
+    
+    <button id="test">Test Connection</button>
+    
+    <div class="footer">
+        Extension ID: <span id="extId">...</span>
+    </div>
+    
+    <script src="popup.js"></script>
+</body>
+</html>

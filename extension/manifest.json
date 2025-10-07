@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Drive Capture v2",
+  "version": "2.0.0",
+  "description": "Simplified video capture for Google Drive",
+  
+  "permissions": [
+    "debugger",
+    "tabs",
+    "storage",
+    "alarms",
+    "nativeMessaging"
+  ],
+  
+  "host_permissions": [
+    "https://drive.google.com/*",
+    "*://*.googlevideo.com/*"
+  ],
+  
+  "background": {
+    "service_worker": "background.js"
+  },
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  
+  "icons": {
+    "128": "icon.png"
+  }
+}

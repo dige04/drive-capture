@@ -1,0 +1,9 @@
+{
+  "name": "com.drivecapture.worker",
+  "description": "Drive Capture v2 Worker",
+  "path": "/Users/hieudinh/Documents/01. 🚀 Projects/drive-capture-v2-main 2/worker/launcher.sh",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://bnilljcmjbhhfefkmjkdlfgolngjiefn/"
+  ]
+}
