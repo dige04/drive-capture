@@ -6,8 +6,7 @@
 // ============ Configuration ============
 const HOST_ID = 'com.drivecapture.worker';
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]; // Exponential backoff
-const CAPTURE_TIMEOUT = 20000; // Increased timeout for capture
-const MAX_TABS = 5; // Max concurrent tabs for capture
+const CAPTURE_TIMEOUT = 5000; // 5 seconds
 
 // ============ State ============
 let port = null;
@@ -17,7 +16,6 @@ let reconnectTimer = null;
 
 // Legacy capture state
 let capturedRequests = {}; // Stores network requests for URL extraction
-let capturePromises = {}; // To manage pending captures by fileId
 let activeTabs = new Set(); // Tracks tabs opened by the extension
 
 // ============ Connection Management ============
@@ -124,86 +122,83 @@ function sendMessage(msg) {
 // Cleans up resources associated with a tab
 function cleanupTabResources(tabId) {
     const debuggee = { tabId: tabId };
+    // Clear any pending promises for this tab
+    if (capturedRequests[tabId]) {
+        clearTimeout(capturedRequests[tabId].timeoutId);
+        delete capturedRequests[tabId];
+    }
+
     chrome.debugger.detach(debuggee, () => {
         if (chrome.runtime.lastError) {
             // console.warn(`[Cleanup] Detach failed for tab ${tabId}:`, chrome.runtime.lastError.message);
         }
-        // Remove captured requests for this tab
-        Object.keys(capturedRequests).forEach(requestId => {
-            if (capturedRequests[requestId].tabId === tabId) {
-                delete capturedRequests[requestId];
-            }
-        });
-        activeTabs.delete(tabId);
-        chrome.tabs.remove(tabId).catch(() => {}); // Close the tab
     });
+    activeTabs.delete(tabId);
+    chrome.tabs.remove(tabId).catch(() => {}); // Close the tab
 }
 
-// Initiates the legacy capture process for a given fileId
+// Initiates the two-step capture process (load, then reload on timeout)
 async function startLegacyCapture(fileId) {
-    console.log(`[Legacy Capture] Starting for ${fileId}`);
+    let tabId;
 
-    // If already capturing this fileId, return
-    if (capturePromises[fileId]) {
-        console.log(`[Legacy Capture] Already processing ${fileId}`);
-        return;
-    }
+    try {
+        // 1. Open tab and attach debugger
+        const url = `https://drive.google.com/file/d/${fileId}/view`;
+        const tab = await chrome.tabs.create({ url, active: false });
+        tabId = tab.id;
+        activeTabs.add(tabId);
 
-    // Clean up oldest tab if too many active
-    if (activeTabs.size >= MAX_TABS) {
-        const oldestTab = activeTabs.values().next().value;
-        console.log(`[Legacy Capture] Closing oldest tab ${oldestTab} to make room.`);
-        cleanupTabResources(oldestTab);
-    }
+        const debuggee = { tabId: tabId };
+        await chrome.debugger.attach(debuggee, "1.3");
+        await chrome.debugger.sendCommand(debuggee, "Network.enable");
 
-    capturePromises[fileId] = new Promise(async (resolve, reject) => {
-        let tabId;
-        let timeoutId;
-
+        // 2. First Attempt (Initial Load)
         try {
-            // Open Drive URL
-            const url = `https://drive.google.com/file/d/${fileId}/view`;
-            const tab = await chrome.tabs.create({ url, active: false });
-            tabId = tab.id;
-            activeTabs.add(tabId);
+            console.log(`[Capture] Attempt 1 (New Tab) for ${fileId}`);
+            const videoUrl = await new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => reject(new Error('Timeout on initial load')), CAPTURE_TIMEOUT);
+                capturedRequests[tabId] = { resolve, reject, timeoutId };
+            });
 
-            const debuggee = { tabId: tabId };
-            await chrome.debugger.attach(debuggee, "1.3");
-            await chrome.debugger.sendCommand(debuggee, "Network.enable");
-
-            // Set a timeout for the capture
-            timeoutId = setTimeout(() => {
-                console.warn(`[Legacy Capture] Timeout for ${fileId} (tab ${tabId})`);
-                cleanupTabResources(tabId);
-                reject(new Error('Capture timed out'));
-            }, CAPTURE_TIMEOUT);
-
-            // Store resolve/reject for later use by onEvent listener
-            capturedRequests[tabId] = { fileId, resolve, reject, timeoutId };
+            console.log(`[Capture] Success on initial load for ${fileId}`);
+            sendResult(fileId, videoUrl, null);
+            cleanupTabResources(tabId);
+            return; // Success, so we are done.
 
         } catch (error) {
-            console.error(`[Legacy Capture] Error initiating for ${fileId}:`, error);
-            if (tabId) cleanupTabResources(tabId);
-            reject(error);
+            console.warn(`[Capture] Timed out on initial load for ${fileId}. Reloading...`);
+            // The promise for the first attempt was rejected by the timeout.
+            // We can now proceed to the reload attempt.
         }
-    });
 
-    capturePromises[fileId].then(videoUrl => {
-        console.log(`[Legacy Capture] Success for ${fileId}: ${videoUrl}`);
-        sendResult(fileId, videoUrl, null);
-    }).catch(error => {
-        console.error(`[Legacy Capture] Failed for ${fileId}:`, error.message);
-        sendResult(fileId, null, error.message);
-    }).finally(() => {
-        // Clean up resources and promise
-        const tabId = Object.keys(capturedRequests).find(id => capturedRequests[id].fileId === fileId);
-        if (tabId) {
-            clearTimeout(capturedRequests[tabId].timeoutId);
-            cleanupTabResources(Number(tabId));
-            delete capturedRequests[tabId]; // Clean up the temporary entry
+        // 3. Second Attempt (Reload)
+        chrome.tabs.reload(tabId);
+
+        try {
+            console.log(`[Capture] Attempt 2 (Reload) for ${fileId}`);
+            const videoUrl = await new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => reject(new Error('Timeout after reload')), CAPTURE_TIMEOUT);
+                capturedRequests[tabId] = { resolve, reject, timeoutId };
+            });
+
+            console.log(`[Capture] Success after reload for ${fileId}`);
+            sendResult(fileId, videoUrl, null);
+
+        } catch (error) {
+            console.error(`[Capture] Failed to capture ${fileId} after reload.`);
+            sendResult(fileId, null, error.message);
         }
-        delete capturePromises[fileId];
-    });
+
+    } catch (criticalError) {
+        // This catches errors from tab creation or debugger attachment
+        console.error(`[Capture] A critical error occurred for ${fileId}:`, criticalError.message);
+        sendResult(fileId, null, criticalError.message);
+    } finally {
+        // 4. Cleanup
+        if (tabId) {
+            cleanupTabResources(tabId);
+        }
+    }
 }
 
 function sendResult(fileId, url, error) {
@@ -220,32 +215,26 @@ function sendResult(fileId, url, error) {
 chrome.tabs.onRemoved.addListener((tabId) => {
     if (activeTabs.has(tabId)) {
         console.log(`[Cleanup] Tab ${tabId} removed unexpectedly.`);
-        cleanupTabResources(tabId);
-        // If there was a pending promise for this tab, reject it
+        // Reject any pending promise for this tab
         if (capturedRequests[tabId] && capturedRequests[tabId].reject) {
-            clearTimeout(capturedRequests[tabId].timeoutId);
             capturedRequests[tabId].reject(new Error('Tab closed unexpectedly'));
         }
+        cleanupTabResources(tabId);
     }
 });
 
 chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
     const tabId = debuggeeId.tabId;
-    if (!activeTabs.has(tabId)) return; // Only process for tabs opened by us
+    if (!activeTabs.has(tabId)) return;
 
-    // Ensure we have a pending capture for this tab
-    if (!capturedRequests[tabId] || !capturedRequests[tabId].fileId) return;
+    const pendingRequest = capturedRequests[tabId];
+    if (!pendingRequest) return;
 
-    if (method === "Network.requestWillBeSent") {
-        if (params.request.url.startsWith("https://workspacevideo-pa.clients6.google.com")) {
-            const requestId = params.requestId;
-            capturedRequests[requestId] = {
-                url: params.request.url,
-                method: params.request.method,
-                timestamp: params.timestamp,
-                tabId: tabId
-            };
-        }
+    if (method === "Network.requestWillBeSent" && params.request.url.startsWith("https://workspacevideo-pa.clients6.google.com")) {
+        const requestId = params.requestId;
+        // Store the main URL against the request ID for later retrieval
+        capturedRequests[requestId] = { url: params.request.url, tabId: tabId };
+
     } else if (method === "Network.responseReceived") {
         const requestId = params.requestId;
         if (capturedRequests[requestId] && capturedRequests[requestId].tabId === tabId) {
@@ -254,31 +243,20 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
                 "Network.getResponseBody",
                 { requestId: requestId },
                 (result) => {
-                    if (chrome.runtime.lastError) {
-                        // console.warn(`[Debugger] getResponseBody failed for tab ${tabId}, req ${requestId}:`, chrome.runtime.lastError.message);
-                        return;
+                    if (chrome.runtime.lastError || !result || !result.body) {
+                        return; // Ignore errors or empty bodies
                     }
-                    capturedRequests[requestId].responseBody = result.body;
-                    capturedRequests[requestId].base64Encoded = result.base64Encoded;
                     try {
                         const data = JSON.parse(result.body);
                         if (data.mediaStreamingData?.formatStreamingData?.progressiveTranscodes) {
                             const transcodes = data.mediaStreamingData.formatStreamingData.progressiveTranscodes;
                             const videoUrl = transcodes[transcodes.length - 1]?.url;
                             if (videoUrl) {
-                                // Resolve the promise for this capture
-                                if (capturedRequests[tabId] && capturedRequests[tabId].resolve) {
-                                    capturedRequests[tabId].resolve(videoUrl);
-                                }
+                                clearTimeout(pendingRequest.timeoutId);
+                                pendingRequest.resolve(videoUrl);
                             }
                         }
-                        // Optionally capture video title if needed by worker
-                        // if (data.mediaMetadata?.title) {
-                        //     capturedRequests[requestId].videoTitle = data.mediaMetadata.title;
-                        // }
-                    } catch (e) {
-                        // console.warn(`[Debugger] Error parsing response body for tab ${tabId}, req ${requestId}:`, e);
-                    }
+                    } catch (e) { /* Ignore JSON parsing errors */ }
                 }
             );
         }

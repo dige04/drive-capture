@@ -37,7 +37,9 @@ drive-capture-v2/
 
 1. **Python 3.7+** installed
 2. **Google Chrome** (version 88+)
-3. **rclone** configured with your cloud storage
+3. **rclone** configured with your cloud storage (which rclone)
+
+- User-Agent for Mac/Linux/Win
 
 ### Installation
 

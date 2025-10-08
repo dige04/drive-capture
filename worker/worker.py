@@ -48,10 +48,12 @@ if config_file.exists():
 jobs_queue = queue.Queue()
 capture_queue = queue.Queue()
 transfer_queue = queue.Queue()
+transfer_done_queue = queue.Queue()
 active_captures = {}
 completed = set()
 shutdown = threading.Event()
 last_progress_update = {} # New global state for rate limiting
+send_lock = threading.Lock()
 
 # ============ Logging ============
 def log(msg, level='INFO'):
@@ -88,9 +90,10 @@ def send_message(msg):
         encoded = json.dumps(msg).encode('utf-8')
         length = struct.pack('=I', len(encoded))
         
-        original_stdout.buffer.write(length)
-        original_stdout.buffer.write(encoded)
-        original_stdout.buffer.flush()
+        with send_lock:
+            original_stdout.buffer.write(length)
+            original_stdout.buffer.write(encoded)
+            original_stdout.buffer.flush()
         
         log(f"Sent: {msg.get('type', 'unknown')}")
         return True
@@ -182,7 +185,7 @@ def run_rclone(job, url):
         '--header', 'Referer: https://drive.google.com/',
         '--multi-thread-cutoff', '0',
         '--multi-thread-streams', '16',
-        '--retries', '5',
+        '--retries', '15',
         '--low-level-retries', '10',
         '--retries-sleep', '20s',
         '--progress'
@@ -259,7 +262,7 @@ def capture_worker():
             log(f"Capture worker error: {e}", 'ERROR')
 
 def transfer_worker():
-    """Process transfers with rclone"""
+    """Process transfers with rclone and signals completion."""
     while not shutdown.is_set():
         try:
             # Get transfer job
@@ -268,17 +271,29 @@ def transfer_worker():
             if job['file_id'] not in completed:
                 run_rclone(job, url)
             
-            # After transfer, queue next capture if available
-            try:
-                next_job = jobs_queue.get_nowait()
-                capture_queue.put(next_job)
-            except queue.Empty: # Handle case where jobs_queue is empty
-                pass 
+            # Signal completion to the scheduler
+            transfer_done_queue.put(1)
                 
         except queue.Empty:
             pass
         except Exception as e:
             log(f"Transfer worker error: {e}", 'ERROR')
+
+def job_scheduler():
+    """Monitors transfer completions and schedules new captures."""
+    while not shutdown.is_set():
+        try:
+            # Wait for a signal that a transfer is done
+            _ = transfer_done_queue.get(timeout=1)
+            
+            # A transfer is done, so we can start a new capture.
+            try:
+                next_job = jobs_queue.get_nowait()
+                capture_queue.put(next_job)
+            except queue.Empty: # Handle case where jobs_queue is empty
+                pass
+        except queue.Empty:
+            pass
 
 def heartbeat_worker():
     """Send periodic ping to keep connection alive"""
@@ -311,13 +326,6 @@ def handle_extension_message(msg):
                 transfer_queue.put((job, url))
             else:
                 log(f"Capture failed for {file_id}: {error}", 'WARN')
-            
-            # Queue next capture
-            try:
-                next_job = jobs_queue.get_nowait()
-                capture_queue.put(next_job)
-            except:
-                pass
 
 # ============ Main ============ 
 def main():
@@ -348,7 +356,8 @@ def main():
     # Start worker threads
     threads = [
         threading.Thread(target=capture_worker, name='Capture'),
-        threading.Thread(target=heartbeat_worker, name='Heartbeat')
+        threading.Thread(target=heartbeat_worker, name='Heartbeat'),
+        threading.Thread(target=job_scheduler, name='Scheduler')
     ]
     for i in range(CONFIG['max_parallel']):
         threads.append(threading.Thread(target=transfer_worker, name=f'Transfer-{i+1}'))
