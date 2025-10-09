@@ -22,17 +22,22 @@ echo.
 
 REM Step 1: Check Python
 echo [1] Checking Python...
-where python >nul 2>&1
+set PYTHON_CMD=python
+where python3 >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
-    echo [OK] Python found
-    python --version
+    set PYTHON_CMD=python3
 ) else (
-    echo [ERROR] Python not found!
-    echo Please install Python from python.org
-    echo Make sure to check "Add Python to PATH"
-    pause
-    exit /b 1
+    where python >nul 2>&1
+    if %ERRORLEVEL% NEQ 0 (
+        echo [ERROR] Python not found!
+        echo Please install Python from python.org
+        echo Make sure to check "Add Python to PATH"
+        pause
+        exit /b 1
+    )
 )
+echo [OK] Python found (%%PYTHON_CMD%%)
+%%PYTHON_CMD%% --version
 echo.
 
 REM Step 2: Load Extension
@@ -110,10 +115,10 @@ set CONFIG_FILE=%PROJECT_DIR%\worker\config.json
 
 (
   echo {
-  echo   "rclone_remote": "%rclone_remote%",
-  echo   "csv_file": "../data/list%csv_file_num%.csv",
-  echo   "max_parallel": %max_parallel_rclone%,
-  echo   "max_captures": 1,
+  echo   "rclone_remote": "%rclone_remote%",,
+  echo   "csv_file": "../data/list%csv_file_num%.csv",,
+  echo   "max_parallel": %max_parallel_rclone%,,
+  echo   "max_captures": 1,,
   echo   "rclone_path": "%rclone_path%"
   echo }
 ) > "%CONFIG_FILE%"
@@ -126,10 +131,13 @@ echo [6] Testing Python worker...
 cd /d "%PROJECT_DIR%\worker"
 echo.
 echo If you see "Drive Capture Worker v2.0 Starting", it works!
-echo Press Ctrl+C to stop test
+echo This test will run for 5 seconds...
 echo.
-timeout /t 2 >nul
-python -u worker.py
+
+REM Start the worker in a new window, wait 5s, then kill it.
+start "Python Worker Test" %PYTHON_CMD% -u worker.py
+timeout /t 5 /nobreak >nul
+taskkill /fi "WINDOWTITLE eq Python Worker Test*" /f >nul 2>&1
 
 echo.
 echo =====================================================
