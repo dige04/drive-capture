@@ -245,6 +245,14 @@ def run_rclone(job, url_or_urls):
                     errors.append(stripped_line)
                     log(f"[{file_id[:8]}] {stripped_line}")
                     send_message({'type': 'rclone_error', 'file_id': file_id, 'error': stripped_line})
+                    # Immediate reset on critical transport errors (cooldown guarded)
+                    lower = stripped_line.lower()
+                    if ('unexpected eof' in lower) or ('connection reset by peer' in lower) or ('http/2' in lower) or ('http2' in lower):
+                        global last_reset_time
+                        now = time.time()
+                        if (now - last_reset_time) >= CONFIG.get('reset_cooldown_sec', 180):
+                            send_message({'type': 'reset_requested', 'reason': 'Critical transport errors (EOF/reset/HTTP2)'});
+                            last_reset_time = now
 
             process.wait()
 
