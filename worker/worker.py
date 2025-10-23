@@ -32,7 +32,11 @@ CONFIG = {
     'csv_file': 'list1.csv',
     'max_parallel': 3,
     'max_captures': 2,
-    'rclone_path': '' # New entry
+    'rclone_path': '', # New entry
+    'max_recapture_attempts': 3,
+    'failure_reset_threshold': 10,
+    'stall_timeout_sec': 900,
+    'reset_cooldown_sec': 180
 }
 
 # Load config if exists
@@ -54,6 +58,9 @@ completed = set()
 shutdown = threading.Event()
 last_progress_update = {} # New global state for rate limiting
 send_lock = threading.Lock()
+job_attempts = {}
+consecutive_failures = 0
+last_reset_time = 0.0
 
 # ============ Logging ============
 def log(msg, level='INFO'):
@@ -163,8 +170,8 @@ def save_completed(file_id):
         pass
 
 # ============ Rclone Transfer ============ 
-def run_rclone(job, url):
-    """Execute rclone transfer"""
+def run_rclone(job, url_or_urls):
+    """Execute rclone transfer with candidate URLs and pattern-based decisions."""
     file_id = job['file_id']
     file_name = job['file_name']
     folder_path = job['folder_path']
@@ -177,63 +184,105 @@ def run_rclone(job, url):
     # Build rclone command
     target = f"{CONFIG['rclone_remote']}:{folder_path}/{file_name}"
     
-    cmd = [
-        rclone_executable, 'copyurl',
-        url,
-        target,
-        '--header', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-        '--header', 'Referer: https://drive.google.com/',
-        '--multi-thread-cutoff', '0',
-        '--multi-thread-streams', '16',
-        '--retries', '15',
-        '--low-level-retries', '10',
-        '--retries-sleep', '20s',
-        '--progress'
-    ]
-    
-    log(f"Starting transfer: {file_name}")
-    send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Starting', 'file_name': file_name})
-    
-    try:
-        # Run rclone
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True
-        )
-        
-        # Monitor output
-        for line in process.stdout:
-            stripped_line = line.strip()
-            if 'Transferred:' in stripped_line:
-                log(f"[{file_id[:8]}] {stripped_line}")
-                
-                # Rate limit progress messages to extension
-                current_time = time.time()
-                if file_id not in last_progress_update or (current_time - last_progress_update[file_id]) >= 300: # 5 minutes
-                    send_message({'type': 'rclone_progress', 'file_id': file_id, 'progress': stripped_line})
-                    last_progress_update[file_id] = current_time
-            elif 'ERROR' in stripped_line:
-                log(f"[{file_id[:8]}] {stripped_line}")
-                send_message({'type': 'rclone_error', 'file_id': file_id, 'error': stripped_line})
-        
-        process.wait()
-        
-        if process.returncode == 0:
-            log(f"Success: {file_name}")
-            send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Success', 'file_name': file_name})
-            save_completed(file_id)
-            return True
-        else:
+    def execute_copy(single_url):
+        """Run rclone for a single URL; return (success, errors, killed_by_watchdog)."""
+        cmd = [
+            rclone_executable, 'copyurl',
+            single_url,
+            target,
+            '--header', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+            '--header', 'Referer: https://drive.google.com/',
+            '--multi-thread-cutoff', '0',
+            '--multi-thread-streams', '16',
+            '--retries', '15',
+            '--low-level-retries', '10',
+            '--retries-sleep', '20s',
+            '--progress'
+        ]
+
+        log(f"Starting transfer: {file_name}")
+        send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Starting', 'file_name': file_name})
+
+        errors = []
+        killed_by_watchdog = False
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+
+            last_output_time = time.time()
+
+            def watchdog():
+                nonlocal killed_by_watchdog
+                stall_limit = CONFIG.get('stall_timeout_sec', 900)
+                while process.poll() is None:
+                    time.sleep(15)
+                    if time.time() - last_output_time > stall_limit:
+                        try:
+                            log(f"Watchdog killing stalled rclone for {file_name}", 'WARN')
+                            process.kill()
+                            killed_by_watchdog = True
+                            break
+                        except Exception:
+                            break
+
+            threading.Thread(target=watchdog, daemon=True).start()
+
+            for line in process.stdout:
+                stripped_line = line.strip()
+                last_output_time = time.time()
+                if 'Transferred:' in stripped_line:
+                    log(f"[{file_id[:8]}] {stripped_line}")
+                    current_time = time.time()
+                    if file_id not in last_progress_update or (current_time - last_progress_update[file_id]) >= 300:
+                        send_message({'type': 'rclone_progress', 'file_id': file_id, 'progress': stripped_line})
+                        last_progress_update[file_id] = current_time
+                elif 'ERROR' in stripped_line or 'Failed to copy' in stripped_line or '404 Not Found' in stripped_line:
+                    errors.append(stripped_line)
+                    log(f"[{file_id[:8]}] {stripped_line}")
+                    send_message({'type': 'rclone_error', 'file_id': file_id, 'error': stripped_line})
+
+            process.wait()
+
+            if process.returncode == 0 and not killed_by_watchdog:
+                log(f"Success: {file_name}")
+                send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Success', 'file_name': file_name})
+                save_completed(file_id)
+                return True, errors, killed_by_watchdog
+
             log(f"Failed: {file_name} (code {process.returncode})", 'ERROR')
             send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Failed', 'file_name': file_name, 'code': process.returncode})
-            return False
-            
-    except Exception as e:
-        log(f"Rclone error: {e}", 'ERROR')
-        send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Error', 'file_name': file_name, 'error': str(e)})
-        return False
+            return False, errors, killed_by_watchdog
+
+        except Exception as e:
+            errors.append(str(e))
+            log(f"Rclone error: {e}", 'ERROR')
+            send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Error', 'file_name': file_name, 'error': str(e)})
+            return False, errors, killed_by_watchdog
+
+    # Normalize urls
+    candidate_urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
+    candidate_urls = [u for u in candidate_urls if u]
+
+    # Try each URL
+    aggregated_errors = []
+    for idx, candidate in enumerate(candidate_urls):
+        success, errors, killed = execute_copy(candidate)
+        if success:
+            return {'success': True, 'action': 'done'}
+        aggregated_errors.extend(errors)
+        # If watchdog killed or 404/EOF type errors, try next candidate
+        if any('404 Not Found' in e or 'unexpected EOF' in e or 'context deadline exceeded' in e or 'connection reset by peer' in e for e in errors) or killed:
+            continue
+        # Other errors: break early
+        break
+
+    # All candidates failed → decide whether to recapture or skip for later
+    return {'success': False, 'action': 'recapture', 'errors': aggregated_errors}
 
 # ============ Worker Threads ============ 
 def capture_worker():
@@ -266,12 +315,45 @@ def transfer_worker():
     while not shutdown.is_set():
         try:
             # Get transfer job
-            job, url = transfer_queue.get(timeout=1)
+            job, url_or_urls = transfer_queue.get(timeout=1)
             
             __import__('time').sleep(__import__('random').uniform(0.08, 0.25))  # jitter chống burst
             
             if job['file_id'] not in completed:
-                run_rclone(job, url)
+                result = run_rclone(job, url_or_urls)
+                file_id = job['file_id']
+                global consecutive_failures
+                if result.get('success'):
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    # Track per-job attempts
+                    job_attempts[file_id] = job_attempts.get(file_id, 0) + 1
+
+                    errors = result.get('errors') or []
+                    has_404 = any('404 Not Found' in e for e in errors)
+                    has_critical = any(('unexpected EOF' in e) or ('connection reset by peer' in e) or ('HTTP/2' in e) or ('HTTP2' in e) for e in errors)
+
+                    if has_404 and result.get('action') == 'recapture' and job_attempts[file_id] <= CONFIG.get('max_recapture_attempts', 3):
+                        # 404: recapture URL for this file only
+                        capture_queue.put(job)
+                    else:
+                        # Skip for now; requeue to end to try later
+                        log(f"Skipping for now after {job_attempts.get(file_id, 0)} attempts: {file_id}", 'WARN')
+                        jobs_queue.put(job)
+
+                    # Immediate controlled reload for critical transport errors (does not stop rclone transfers)
+                    if has_critical:
+                        global last_reset_time
+                        now = time.time()
+                        if (now - last_reset_time) >= CONFIG.get('reset_cooldown_sec', 180):
+                            send_message({'type': 'reset_requested', 'reason': 'Critical transport errors (EOF/reset/HTTP2)'});
+                            last_reset_time = now
+
+                    # Controlled reset signal if too many consecutive failures
+                    if consecutive_failures >= CONFIG.get('failure_reset_threshold', 10):
+                        send_message({'type': 'reset_requested', 'reason': 'Too many consecutive failures'})
+                        consecutive_failures = 0
             
             # Signal completion to the scheduler
             transfer_done_queue.put(1)
@@ -318,6 +400,7 @@ def handle_extension_message(msg):
     elif msg_type == 'result':
         file_id = msg.get('file_id')
         url = msg.get('url')
+        urls = msg.get('urls')
         error = msg.get('error')
         
         if file_id in active_captures:
@@ -325,9 +408,22 @@ def handle_extension_message(msg):
             
             if url:
                 log(f"Got URL for {file_id}")
-                transfer_queue.put((job, url))
+                # Pass all candidate URLs if available, try primary first
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    # Ensure primary is first
+                    candidates = [url] + [u for u in urls if u != url]
+                    transfer_queue.put((job, candidates))
+                else:
+                    transfer_queue.put((job, url))
             else:
                 log(f"Capture failed for {file_id}: {error}", 'WARN')
+                # Schedule a retry capture up to configured attempts
+                attempts = job_attempts.get(file_id, 0)
+                if attempts < CONFIG.get('max_recapture_attempts', 3):
+                    job_attempts[file_id] = attempts + 1
+                    capture_queue.put(job)
+                else:
+                    jobs_queue.put(job)
 
 # ============ Main ============ 
 def main():

@@ -13,6 +13,9 @@ let port = null;
 let connected = false;
 let reconnectAttempt = 0;
 let reconnectTimer = null;
+let lastMessageAt = Date.now();
+let lastReloadAt = 0;
+const RELOAD_COOLDOWN_MS = 180000; // 3 minutes
 
 // Legacy capture state
 let capturedRequests = {}; // Stores network requests for URL extraction
@@ -37,6 +40,7 @@ function connect() {
 }
 
 function handleMessage(msg) {
+    lastMessageAt = Date.now();
     console.log('[Message]', msg);
     
     switch(msg.type) {
@@ -68,6 +72,23 @@ function handleMessage(msg) {
 
         case 'rclone_error':
             console.error(`[Rclone Error] ${msg.file_id}: ${msg.error}`);
+            break;
+        
+        case 'reset_requested':
+            console.warn(`[Reset] Worker requested reset: ${msg.reason || 'no reason provided'}`);
+            // Reload the extension to get a clean state and reconnect to native host
+            try {
+                const now = Date.now();
+                if (now - lastReloadAt > RELOAD_COOLDOWN_MS) {
+                    lastReloadAt = now;
+                    chrome.runtime.reload();
+                } else {
+                    console.warn('[Reset] Ignored due to cooldown');
+                }
+            } catch (e) {
+                console.warn('[Reset] Reload failed, trying to restart native connection');
+                try { if (port) port.disconnect(); } catch (_) {}
+            }
             break;
             
         default:
@@ -161,7 +182,9 @@ async function startLegacyCapture(fileId) {
             });
 
             console.log(`[Capture] Success on initial load for ${fileId}`);
-            sendResult(fileId, videoUrl, null);
+            // Send both primary URL and all candidate URLs if available (filled in debugger listener)
+            const urls = capturedRequests[tabId]?.urls || undefined;
+            sendResult(fileId, videoUrl, null, urls);
             cleanupTabResources(tabId);
             return; // Success, so we are done.
 
@@ -182,17 +205,18 @@ async function startLegacyCapture(fileId) {
             });
 
             console.log(`[Capture] Success after reload for ${fileId}`);
-            sendResult(fileId, videoUrl, null);
+            const urls = capturedRequests[tabId]?.urls || undefined;
+            sendResult(fileId, videoUrl, null, urls);
 
         } catch (error) {
             console.error(`[Capture] Failed to capture ${fileId} after reload.`);
-            sendResult(fileId, null, error.message);
+            sendResult(fileId, null, error.message, undefined);
         }
 
     } catch (criticalError) {
         // This catches errors from tab creation or debugger attachment
         console.error(`[Capture] A critical error occurred for ${fileId}:`, criticalError.message);
-        sendResult(fileId, null, criticalError.message);
+        sendResult(fileId, null, criticalError.message, undefined);
     } finally {
         // 4. Cleanup
         if (tabId) {
@@ -201,12 +225,13 @@ async function startLegacyCapture(fileId) {
     }
 }
 
-function sendResult(fileId, url, error) {
+function sendResult(fileId, url, error, urls) {
     sendMessage({
         type: 'result',
         file_id: fileId,
         url: url,
-        error: error
+        error: error,
+        urls: urls
     });
 }
 
@@ -250,9 +275,12 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
                         const data = JSON.parse(result.body);
                         if (data.mediaStreamingData?.formatStreamingData?.progressiveTranscodes) {
                             const transcodes = data.mediaStreamingData.formatStreamingData.progressiveTranscodes;
-                            const videoUrl = transcodes[transcodes.length - 1]?.url;
+                            const urls = (transcodes || []).map(t => t?.url).filter(Boolean);
+                            const videoUrl = urls[urls.length - 1];
                             if (videoUrl) {
                                 clearTimeout(pendingRequest.timeoutId);
+                                // Attach all candidate urls to the pending request so sender can include them
+                                capturedRequests[tabId] = { ...capturedRequests[tabId], urls };
                                 pendingRequest.resolve(videoUrl);
                             }
                         }
@@ -266,7 +294,16 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
 // Keep service worker alive
 chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => {
-    if (!connected) connect();
+    if (!connected) {
+        connect();
+        return;
+    }
+    // Watchdog: if no messages received for over 2 minutes while connected, restart native host
+    const STALE_MS = 2 * 60 * 1000;
+    if (Date.now() - lastMessageAt > STALE_MS) {
+        console.warn('[Watchdog] No messages from worker recently, restarting native connection');
+        try { if (port) port.disconnect(); } catch (_) {}
+    }
 });
 
 // Popup communication (simplified, only status)
