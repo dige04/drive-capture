@@ -268,6 +268,8 @@ def transfer_worker():
             # Get transfer job
             job, url = transfer_queue.get(timeout=1)
             
+            __import__('time').sleep(__import__('random').uniform(0.08, 0.25))  # jitter chống burst
+            
             if job['file_id'] not in completed:
                 run_rclone(job, url)
             
