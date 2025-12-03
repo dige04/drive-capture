@@ -14,6 +14,7 @@ import queue
 import time
 import subprocess
 import csv
+import uuid
 from pathlib import Path
 
 # ============ Platform Setup ============
@@ -32,11 +33,15 @@ CONFIG = {
     'csv_file': 'list1.csv',
     'max_parallel': 3,
     'max_captures': 2,
-    'rclone_path': '', # New entry
+    'rclone_path': '',  # Optional override for rclone path
     'max_recapture_attempts': 3,
     'failure_reset_threshold': 10,
     'stall_timeout_sec': 900,
-    'reset_cooldown_sec': 180
+    'reset_cooldown_sec': 180,
+    # Upper bound on how many captured-but-not-yet-transferred jobs we
+    # allow to sit in transfer_queue/. This helps avoid using very old
+    # video playback URLs that may have expired.
+    'max_pending_transfers': 32,
 }
 
 # Load config if exists
@@ -45,22 +50,32 @@ if config_file.exists():
     try:
         with open(config_file) as f:
             CONFIG.update(json.load(f))
-    except:
+    except Exception:
         pass
+
+# Derive a sane default backlog limit if not explicitly configured.
+# Tie it to the max_parallel transfer setting so we don't capture far
+# ahead of what the transfer daemon can process while video URLs are
+# still fresh.
+if 'max_pending_transfers' not in CONFIG:
+    try:
+        max_parallel = int(CONFIG.get('max_parallel', 3) or 1)
+    except Exception:
+        max_parallel = 3
+    CONFIG['max_pending_transfers'] = max_parallel * 4
 
 # ============ Global State ============
 jobs_queue = queue.Queue()
-capture_queue = queue.Queue()
-transfer_queue = queue.Queue()
-transfer_done_queue = queue.Queue()
 active_captures = {}
 completed = set()
 shutdown = threading.Event()
-last_progress_update = {} # New global state for rate limiting
 send_lock = threading.Lock()
-job_attempts = {}
-consecutive_failures = 0
-last_reset_time = 0.0
+# Per-file capture retry tracking (capture-only; transfers handled by transfer_daemon)
+capture_attempts = {}
+
+# Persistent transfer queue directory (consumed by transfer_daemon.py)
+QUEUE_DIR = (Path(__file__).parent / 'transfer_queue').resolve()
+QUEUE_DIR.mkdir(exist_ok=True)
 
 # ============ Logging ============
 def log(msg, level='INFO'):
@@ -156,236 +171,132 @@ def load_jobs():
     return jobs
 
 def save_completed(file_id):
-    """Mark job as completed"""
+    """Legacy helper (no longer used in capture-only worker).
+
+    Completion is now the responsibility of transfer_daemon.py, which updates
+    the .completed.txt file after successful rclone transfers.
+    This function is kept for backward compatibility but is not called.
+    """
     completed.add(file_id)
     
     csv_path = get_csv_path()
-    
     completed_file = csv_path.with_suffix('.completed.txt')
-    
     try:
         with open(completed_file, 'a') as f:
             f.write(f"{file_id}\n")
-    except:
+    except Exception:
         pass
 
-# ============ Rclone Transfer ============ 
-def run_rclone(job, url_or_urls):
-    """Execute rclone transfer with candidate URLs and pattern-based decisions."""
+
+# ============ Transfer Job Enqueue (for transfer_daemon) ============
+def enqueue_transfer_job(job, url_or_urls):
+    """Persist a transfer job to QUEUE_DIR for transfer_daemon.py to consume.
+
+    Each queued job is a JSON file containing file metadata and candidate
+    URLs. The transfer daemon is responsible for retries, backoff, and
+    marking jobs completed.
+    """
     file_id = job['file_id']
-    file_name = job['file_name']
-    folder_path = job['folder_path']
-    
-    # Determine rclone executable path
-    rclone_executable = CONFIG.get('rclone_path', '')
-    if not rclone_executable:
-        rclone_executable = 'rclone' # Fallback to PATH if not specified
-    
-    # Build rclone command
-    target = f"{CONFIG['rclone_remote']}:{folder_path}/{file_name}"
-    
-    def execute_copy(single_url):
-        """Run rclone for a single URL; return (success, errors, killed_by_watchdog)."""
-        cmd = [
-            rclone_executable, 'copyurl',
-            single_url,
-            target,
-            '--header', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-            '--header', 'Referer: https://drive.google.com/',
-            '--multi-thread-cutoff', '0',
-            '--multi-thread-streams', '16',
-            '--retries', '15',
-            '--low-level-retries', '10',
-            '--retries-sleep', '20s',
-            '--progress'
-        ]
+    urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
+    urls = [u for u in urls if u]
+    if not urls:
+        log(f"enqueue_transfer_job called with no URLs for {file_id}", 'WARN')
+        return
 
-        log(f"Starting transfer: {file_name}")
-        send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Starting', 'file_name': file_name})
+    payload = {
+        'file_id': file_id,
+        'folder_path': job.get('folder_path', ''),
+        'file_name': job.get('file_name', f'{file_id}.mp4'),
+        'urls': urls,
+        'created_at': time.time(),
+        # transfer_daemon will manage these fields
+        'attempts': 0,
+        'next_attempt_at': 0.0,
+        'last_error': None,
+    }
 
-        errors = []
-        killed_by_watchdog = False
+    fname = f"{file_id}_{uuid.uuid4().hex}.json"
+    tmp_path = QUEUE_DIR / (fname + '.tmp')
+    final_path = QUEUE_DIR / fname
 
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True
-            )
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, final_path)  # atomic on POSIX
+        log(f"Enqueued transfer job for {file_id} -> {final_path}")
+    except Exception as e:
+        log(f"Failed to enqueue transfer job for {file_id}: {e}", 'ERROR')
 
-            last_output_time = time.time()
-
-            def watchdog():
-                nonlocal killed_by_watchdog
-                stall_limit = CONFIG.get('stall_timeout_sec', 900)
-                while process.poll() is None:
-                    time.sleep(15)
-                    if time.time() - last_output_time > stall_limit:
-                        try:
-                            log(f"Watchdog killing stalled rclone for {file_name}", 'WARN')
-                            process.kill()
-                            killed_by_watchdog = True
-                            break
-                        except Exception:
-                            break
-
-            threading.Thread(target=watchdog, daemon=True).start()
-
-            for line in process.stdout:
-                stripped_line = line.strip()
-                last_output_time = time.time()
-                if 'Transferred:' in stripped_line:
-                    log(f"[{file_id[:8]}] {stripped_line}")
-                    current_time = time.time()
-                    if file_id not in last_progress_update or (current_time - last_progress_update[file_id]) >= 300:
-                        send_message({'type': 'rclone_progress', 'file_id': file_id, 'progress': stripped_line})
-                        last_progress_update[file_id] = current_time
-                elif 'ERROR' in stripped_line or 'Failed to copy' in stripped_line or '404 Not Found' in stripped_line:
-                    errors.append(stripped_line)
-                    log(f"[{file_id[:8]}] {stripped_line}")
-                    send_message({'type': 'rclone_error', 'file_id': file_id, 'error': stripped_line})
-                    # Immediate reset on critical transport errors (cooldown guarded)
-                    lower = stripped_line.lower()
-                    if ('unexpected eof' in lower) or ('connection reset by peer' in lower) or ('http/2' in lower) or ('http2' in lower):
-                        global last_reset_time
-                        now = time.time()
-                        if (now - last_reset_time) >= CONFIG.get('reset_cooldown_sec', 180):
-                            send_message({'type': 'reset_requested', 'reason': 'Critical transport errors (EOF/reset/HTTP2)'});
-                            last_reset_time = now
-
-            process.wait()
-
-            if process.returncode == 0 and not killed_by_watchdog:
-                log(f"Success: {file_name}")
-                send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Success', 'file_name': file_name})
-                save_completed(file_id)
-                return True, errors, killed_by_watchdog
-
-            log(f"Failed: {file_name} (code {process.returncode})", 'ERROR')
-            send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Failed', 'file_name': file_name, 'code': process.returncode})
-            return False, errors, killed_by_watchdog
-
-        except Exception as e:
-            errors.append(str(e))
-            log(f"Rclone error: {e}", 'ERROR')
-            send_message({'type': 'rclone_status', 'file_id': file_id, 'status': 'Error', 'file_name': file_name, 'error': str(e)})
-            return False, errors, killed_by_watchdog
-
-    # Normalize urls
-    candidate_urls = url_or_urls if isinstance(url_or_urls, list) else [url_or_urls]
-    candidate_urls = [u for u in candidate_urls if u]
-
-    # Try each URL
-    aggregated_errors = []
-    for idx, candidate in enumerate(candidate_urls):
-        success, errors, killed = execute_copy(candidate)
-        if success:
-            return {'success': True, 'action': 'done'}
-        aggregated_errors.extend(errors)
-        # If watchdog killed or 404/EOF type errors, try next candidate
-        if any('404 Not Found' in e or 'unexpected EOF' in e or 'context deadline exceeded' in e or 'connection reset by peer' in e for e in errors) or killed:
-            continue
-        # Other errors: break early
-        break
-
-    # All candidates failed → decide whether to recapture or skip for later
-    return {'success': False, 'action': 'recapture', 'errors': aggregated_errors}
+# NOTE: Rclone transfer logic has moved to transfer_daemon.py.
+# The worker now acts purely as a capture coordinator and enqueues
+# transfer jobs for the daemon to process.
 
 # ============ Worker Threads ============ 
 def capture_worker():
-    """Request captures from extension"""
+    """Request captures from extension.
+
+    This worker pulls jobs directly from jobs_queue and limits concurrent
+    captures via active_captures and CONFIG['max_captures'].
+    """
     while not shutdown.is_set():
         try:
-            # Check capture slots
-            if len(active_captures) < CONFIG['max_captures']:
-                # Get next job
-                job = capture_queue.get(timeout=1)
-                
-                if job['file_id'] not in completed:
-                    active_captures[job['file_id']] = job
-                    
-                    # Request capture
-                    send_message({
-                        'type': 'capture',
-                        'file_id': job['file_id']
-                    })
-                    
-                    log(f"Requested capture: {job['file_id']}")
-                    
+            # Apply backpressure based on how many pending transfer jobs
+            # are already sitting in QUEUE_DIR. This keeps us from
+            # capturing far ahead of the transfer daemon and ending up
+            # with stale (expired) video playback URLs.
+            try:
+                max_pending = int(CONFIG.get('max_pending_transfers', 0) or 0)
+            except Exception:
+                max_pending = 0
+
+            if max_pending > 0:
+                try:
+                    pending = sum(1 for _ in QUEUE_DIR.glob('*.json'))
+                except Exception as e:
+                    log(f"Queue size check failed: {e}", 'WARN')
+                    pending = 0
+
+                if pending >= max_pending:
+                    time.sleep(1.0)
+                    continue
+
+            # Respect capture concurrency limit
+            if len(active_captures) >= CONFIG['max_captures']:
+                time.sleep(0.1)
+                continue
+
+            # Get next job that still needs capture
+            job = jobs_queue.get(timeout=1)
+            file_id = job['file_id']
+
+            if file_id in completed:
+                # Already completed according to CSV snapshot; skip
+                continue
+
+            if file_id in active_captures:
+                # Already being captured; requeue to avoid duplicate capture
+                jobs_queue.put(job)
+                continue
+
+            active_captures[file_id] = job
+
+            send_message({
+                'type': 'capture',
+                'file_id': file_id
+            })
+            log(f"Requested capture: {file_id} (active_captures={len(active_captures)})")
+
         except queue.Empty:
-            pass
+            # No jobs currently pending
+            time.sleep(0.1)
         except Exception as e:
             log(f"Capture worker error: {e}", 'ERROR')
 
-def transfer_worker():
-    """Process transfers with rclone and signals completion."""
-    while not shutdown.is_set():
-        try:
-            # Get transfer job
-            job, url_or_urls = transfer_queue.get(timeout=1)
-            
-            __import__('time').sleep(__import__('random').uniform(0.08, 0.25))  # jitter chống burst
-            
-            if job['file_id'] not in completed:
-                result = run_rclone(job, url_or_urls)
-                file_id = job['file_id']
-                global consecutive_failures
-                if result.get('success'):
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                    # Track per-job attempts
-                    job_attempts[file_id] = job_attempts.get(file_id, 0) + 1
+# NOTE: Transfer work is now handled by transfer_daemon.py.
 
-                    errors = result.get('errors') or []
-                    has_404 = any('404 Not Found' in e for e in errors)
-                    has_critical = any(('unexpected EOF' in e) or ('connection reset by peer' in e) or ('HTTP/2' in e) or ('HTTP2' in e) for e in errors)
-
-                    if has_404 and result.get('action') == 'recapture' and job_attempts[file_id] <= CONFIG.get('max_recapture_attempts', 3):
-                        # 404: recapture URL for this file only
-                        capture_queue.put(job)
-                    else:
-                        # Skip for now; requeue to end to try later
-                        log(f"Skipping for now after {job_attempts.get(file_id, 0)} attempts: {file_id}", 'WARN')
-                        jobs_queue.put(job)
-
-                    # Immediate controlled reload for critical transport errors (does not stop rclone transfers)
-                    if has_critical:
-                        global last_reset_time
-                        now = time.time()
-                        if (now - last_reset_time) >= CONFIG.get('reset_cooldown_sec', 180):
-                            send_message({'type': 'reset_requested', 'reason': 'Critical transport errors (EOF/reset/HTTP2)'});
-                            last_reset_time = now
-
-                    # Controlled reset signal if too many consecutive failures
-                    if consecutive_failures >= CONFIG.get('failure_reset_threshold', 10):
-                        send_message({'type': 'reset_requested', 'reason': 'Too many consecutive failures'})
-                        consecutive_failures = 0
-            
-            # Signal completion to the scheduler
-            transfer_done_queue.put(1)
-                
-        except queue.Empty:
-            pass
-        except Exception as e:
-            log(f"Transfer worker error: {e}", 'ERROR')
-
-def job_scheduler():
-    """Monitors transfer completions and schedules new captures."""
-    while not shutdown.is_set():
-        try:
-            # Wait for a signal that a transfer is done
-            _ = transfer_done_queue.get(timeout=1)
-            
-            # A transfer is done, so we can start a new capture.
-            try:
-                next_job = jobs_queue.get_nowait()
-                capture_queue.put(next_job)
-            except queue.Empty: # Handle case where jobs_queue is empty
-                pass
-        except queue.Empty:
-            pass
+# NOTE: job scheduling between transfers and captures is no longer
+# required in the capture-only worker. Captures pull directly from
+# jobs_queue, and transfers are managed independently by transfer_daemon.
 
 def heartbeat_worker():
     """Send periodic ping to keep connection alive"""
@@ -415,23 +326,24 @@ def handle_extension_message(msg):
             job = active_captures.pop(file_id)
             
             if url:
-                log(f"Got URL for {file_id}")
-                # Pass all candidate URLs if available, try primary first
+                # Successful capture; enqueue transfer job for daemon
+                log(f"Got URL for {file_id}, enqueueing transfer job")
                 if urls and isinstance(urls, list) and len(urls) > 0:
-                    # Ensure primary is first
                     candidates = [url] + [u for u in urls if u != url]
-                    transfer_queue.put((job, candidates))
+                    enqueue_transfer_job(job, candidates)
                 else:
-                    transfer_queue.put((job, url))
+                    enqueue_transfer_job(job, url)
             else:
+                # Capture failed; limited recapture attempts
                 log(f"Capture failed for {file_id}: {error}", 'WARN')
-                # Schedule a retry capture up to configured attempts
-                attempts = job_attempts.get(file_id, 0)
-                if attempts < CONFIG.get('max_recapture_attempts', 3):
-                    job_attempts[file_id] = attempts + 1
-                    capture_queue.put(job)
-                else:
+                attempts = capture_attempts.get(file_id, 0)
+                attempts += 1
+                capture_attempts[file_id] = attempts
+                if attempts <= CONFIG.get('max_recapture_attempts', 3):
+                    log(f"Scheduling recapture for {file_id} (attempt {attempts})", 'WARN')
                     jobs_queue.put(job)
+                else:
+                    log(f"Giving up on capture for {file_id} after {attempts} attempts", 'ERROR')
 
 # ============ Main ============ 
 def main():
@@ -448,25 +360,15 @@ def main():
     # Load jobs
     jobs = load_jobs()
     if jobs:
-        # Queue all jobs
+        # Queue all jobs; capture_worker will pull directly from jobs_queue
         for job in jobs:
             jobs_queue.put(job)
-        
-        # Start initial captures (up to max_parallel)
-        for _ in range(min(CONFIG['max_parallel'], len(jobs))): # Changed from max_captures
-            try:
-                capture_queue.put(jobs_queue.get_nowait())
-            except queue.Empty: # Handle case where jobs_queue is empty
-                break
     
-    # Start worker threads
+    # Start worker threads (capture + heartbeat only)
     threads = [
         threading.Thread(target=capture_worker, name='Capture'),
         threading.Thread(target=heartbeat_worker, name='Heartbeat'),
-        threading.Thread(target=job_scheduler, name='Scheduler')
     ]
-    for i in range(CONFIG['max_parallel']):
-        threads.append(threading.Thread(target=transfer_worker, name=f'Transfer-{i+1}'))
     
     for t in threads:
         t.daemon = True

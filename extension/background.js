@@ -283,6 +283,7 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
                                 capturedRequests[tabId] = { ...capturedRequests[tabId], urls };
                                 pendingRequest.resolve(videoUrl);
                             }
+
                         }
                     } catch (e) { /* Ignore JSON parsing errors */ }
                 }

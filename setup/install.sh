@@ -126,6 +126,11 @@ csv_file_num=${csv_file_num:-1}
 max_parallel_rclone=${max_parallel_rclone:-3}
 rclone_path=${rclone_path:-}
 
+# Limit how far ahead we capture URLs relative to transfer capacity.
+# By default we allow a backlog of ~4x the parallel transfer count so
+# video playback URLs stay reasonably fresh.
+max_pending_transfers=$(( max_parallel_rclone * 4 ))
+
 CONFIG_FILE="$PROJECT_DIR/worker/config.json"
 
 cat > "$CONFIG_FILE" <<EOT
@@ -134,6 +139,7 @@ cat > "$CONFIG_FILE" <<EOT
   "csv_file": "../data/list${csv_file_num}.csv",
   "max_parallel": $max_parallel_rclone,
   "max_captures": 1,
+  "max_pending_transfers": $max_pending_transfers,
   "rclone_path": "$rclone_path"
 }
 EOT

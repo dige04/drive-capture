@@ -79,16 +79,22 @@ Required columns:
 
 ## ⚙️ Configuration
 
-Edit `worker/config.json`:
+Edit `worker/config.json` (created by the installer):
 
 ```json
 {
   "rclone_remote": "your_remote_name",
-  "csv_file": "../data/list.csv",
-  "max_parallel": 3,
-  "max_captures": 2
+  "csv_file": "../data/list1.csv",
+  "max_parallel": 3,             // rclone transfer concurrency (transfer_daemon)
+  "max_captures": 1,             // concurrent Chrome captures
+  "max_pending_transfers": 12,   // cap on queued transfers so URLs stay fresh
+  "rclone_path": "/full/path/to/rclone" // optional override
 }
 ```
+
+The installer will set `max_pending_transfers` to about `4 × max_parallel`
+by default so the capture worker does not get too far ahead of the
+transfer daemon while video playback URLs are still valid.
 
 ## 🔍 How It Works
 

@@ -40,15 +40,32 @@ The system is now ready. Place your `list.csv` in the `data/` folder and the wor
 
 ## File Locations
 
-- **CSV file**: `data/list.csv`
-- **Completed tracking**: `data/list.completed.txt`
+- **CSV file(s)**: `data/listN.csv` (configured via `worker/config.json`)
+- **Completed tracking**: `data/listN.completed.txt`
 - **Config**: `worker/config.json`
-- **Logs**: Run `python worker/worker.py` to see
+- **Transfer daemon log**: `worker/transfer_daemon.log`
+
+## Recommended "automatic + logging" workflow
+
+From the repository root:
+
+```bash
+# 1) Start watching the transfer daemon log (waits for file to appear)
+tail -F worker/transfer_daemon.log
+```
+
+Then:
+
+1. Run `./setup/install.sh` once (or after pulling new code).
+2. Restart Chrome completely.
+3. Make sure the Drive Capture extension is enabled; when its background
+   script connects to the native host, `launcher.sh` will auto-start
+   `transfer_daemon.py` and logs will show up in that `tail -F` session.
 
 ## Common Commands
 
 ```bash
-# Test worker manually
+# Test capture worker manually (does not run transfers)
 cd worker && python3 -u worker.py
 
 # Check extension ID
