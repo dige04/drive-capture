@@ -119,12 +119,16 @@ read -p "Enter your rclone remote name (default: ngonga339): " rclone_remote
 read -p "Enter the CSV file number to use, 1-20 (default: 1): " csv_file_num
 read -p "Enter the max parallel rclone jobs (default: 3): " max_parallel_rclone
 read -p "Enter the absolute path to your rclone executable (e.g., /opt/homebrew/bin/rclone): " rclone_path
+read -p "Enter the User-Agent string for rclone HTTP requests (paste from Chrome's navigator.userAgent, or press Enter for default): " user_agent
 
 # Set defaults if empty
 rclone_remote=${rclone_remote:-"ngonga339"}
 csv_file_num=${csv_file_num:-1}
 max_parallel_rclone=${max_parallel_rclone:-3}
 rclone_path=${rclone_path:-}
+
+# If user didn't provide UA, fall back to a generic recent Chrome UA.
+user_agent=${user_agent:-"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"}
 
 # Limit how far ahead we capture URLs relative to transfer capacity.
 # By default we allow a backlog of ~4x the parallel transfer count so
@@ -140,7 +144,8 @@ cat > "$CONFIG_FILE" <<EOT
   "max_parallel": $max_parallel_rclone,
   "max_captures": 1,
   "max_pending_transfers": $max_pending_transfers,
-  "rclone_path": "$rclone_path"
+  "rclone_path": "$rclone_path",
+  "user_agent": "$user_agent"
 }
 EOT
 

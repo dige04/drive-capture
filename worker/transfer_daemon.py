@@ -34,6 +34,10 @@ CONFIG = {
     'max_transfer_attempts': 5,
     'backoff_base_sec': 30,
     'backoff_max_sec': 900,
+    # Default User-Agent for rclone HTTP requests. This can be overridden
+    # in worker/config.json to match the actual browser UA on the
+    # machine running Drive Capture.
+    'user_agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
 }
 
 # Load config if exists (shared with worker.py)
@@ -181,11 +185,16 @@ def run_rclone(job: Dict[str, Any], urls: List[str]) -> Dict[str, Any]:
         errors: List[str] = []
         killed_by_watchdog = False
 
+        # User-Agent header is configurable via CONFIG['user_agent'] so
+        # it can match the real Chrome UA on this machine (helps avoid
+        # 403s from overly strict backends).
+        ua = CONFIG.get('user_agent') or 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
+
         cmd = [
             rclone_executable, 'copyurl',
             single_url,
             target,
-            '--header', 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+            '--header', f'User-Agent: {ua}',
             '--header', 'Referer: https://drive.google.com/',
             '--multi-thread-cutoff', '0',
             '--multi-thread-streams', '4',

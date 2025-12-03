@@ -88,7 +88,8 @@ Edit `worker/config.json` (created by the installer):
   "max_parallel": 3,             // rclone transfer concurrency (transfer_daemon)
   "max_captures": 1,             // concurrent Chrome captures
   "max_pending_transfers": 12,   // cap on queued transfers so URLs stay fresh
-  "rclone_path": "/full/path/to/rclone" // optional override
+  "rclone_path": "/full/path/to/rclone", // optional override
+  "user_agent": "<paste from your Chrome navigator.userAgent>"
 }
 ```
 
