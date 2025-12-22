@@ -1,0 +1,5 @@
+# Drive Capture Worker Dependencies
+
+# Required for inline URL refresh (Option C)
+# After installing, run: playwright install chromium
+playwright>=1.40.0

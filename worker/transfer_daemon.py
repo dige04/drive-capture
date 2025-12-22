@@ -24,6 +24,17 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any
 
+# URL refresh support (optional, requires playwright)
+try:
+    from url_refresher import is_url_expired, refresh_job_urls, PLAYWRIGHT_AVAILABLE
+    URL_REFRESH_AVAILABLE = PLAYWRIGHT_AVAILABLE
+except ImportError:
+    URL_REFRESH_AVAILABLE = False
+    def is_url_expired(created_at: float, max_age: float = 14400) -> bool:
+        return (time.time() - created_at) > max_age
+    def refresh_job_urls(job: dict, max_age: float = 14400, log_fn=None) -> dict:
+        return job
+
 # ============ Configuration ============
 CONFIG = {
     'rclone_remote': 'ngonga339',
@@ -34,6 +45,9 @@ CONFIG = {
     'max_transfer_attempts': 5,
     'backoff_base_sec': 30,
     'backoff_max_sec': 900,
+    # URL freshness settings
+    'url_max_age_sec': 14400,       # 4 hours - refresh URLs older than this
+    'enable_url_refresh': True,     # Set to False to disable inline refresh
     # Default User-Agent for rclone HTTP requests. This can be overridden
     # in worker/config.json to match the actual browser UA on the
     # machine running Drive Capture.
@@ -331,6 +345,18 @@ def process_job_file(job_path: Path) -> None:
 
     job['attempts'] = attempts
 
+    # Check URL freshness and refresh if needed (before transfer attempt)
+    created_at = float(job.get('created_at', 0))
+    url_max_age = CONFIG.get('url_max_age_sec', 14400)
+    enable_refresh = CONFIG.get('enable_url_refresh', True) and URL_REFRESH_AVAILABLE
+
+    if enable_refresh and created_at > 0 and is_url_expired(created_at, url_max_age):
+        age_hours = (time.time() - created_at) / 3600
+        log(f"[{file_id[:8]}] URL is {age_hours:.1f}h old (max {url_max_age/3600:.1f}h), refreshing...")
+        job = refresh_job_urls(job, max_age=url_max_age, log_fn=log)
+        # Update the locked file with refreshed data in case we fail
+        write_job(locked, job)
+
     urls = job.get('urls') or []
     log(f"[{file_id[:8]}] transfer attempt {attempts} with {len(urls)} URL(s)")
 
@@ -384,6 +410,10 @@ def main() -> None:
     log(f"Python: {platform.python_version()}")
     log(f"Queue dir: {QUEUE_DIR}")
     log(f"Failed dir: {FAILED_DIR}")
+    if URL_REFRESH_AVAILABLE:
+        log(f"URL refresh: ENABLED (max age: {CONFIG.get('url_max_age_sec', 14400)/3600:.1f}h)")
+    else:
+        log("URL refresh: DISABLED (install playwright for auto-refresh)")
     log("=" * 60)
 
     load_completed()
