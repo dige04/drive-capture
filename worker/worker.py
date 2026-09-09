@@ -208,6 +208,10 @@ def enqueue_transfer_job(job, url_or_urls):
         'folder_path': job.get('folder_path', ''),
         'file_name': job.get('file_name', f'{file_id}.mp4'),
         'urls': urls,
+        # Captured from the browser that produced these URLs. Google's video
+        # CDN checks the UA version against a hash baked into the signed URL
+        # (eaua), so a stale UA turns every transfer into a 403.
+        'user_agent': job.get('user_agent'),
         'created_at': time.time(),
         # transfer_daemon will manage these fields
         'attempts': 0,
@@ -321,13 +325,16 @@ def handle_extension_message(msg):
         url = msg.get('url')
         urls = msg.get('urls')
         error = msg.get('error')
-        
+        user_agent = msg.get('user_agent')
+
         if file_id in active_captures:
             job = active_captures.pop(file_id)
-            
+
             if url:
                 # Successful capture; enqueue transfer job for daemon
                 log(f"Got URL for {file_id}, enqueueing transfer job")
+                if user_agent:
+                    job['user_agent'] = user_agent
                 if urls and isinstance(urls, list) and len(urls) > 0:
                     candidates = [url] + [u for u in urls if u != url]
                     enqueue_transfer_job(job, candidates)

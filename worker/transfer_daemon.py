@@ -199,10 +199,10 @@ def run_rclone(job: Dict[str, Any], urls: List[str]) -> Dict[str, Any]:
         errors: List[str] = []
         killed_by_watchdog = False
 
-        # User-Agent header is configurable via CONFIG['user_agent'] so
-        # it can match the real Chrome UA on this machine (helps avoid
-        # 403s from overly strict backends).
-        ua = CONFIG.get('user_agent') or 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
+        # Google's video CDN validates the UA version against a hash baked
+        # into the signed URL (eaua), so the UA of the browser that captured
+        # this job wins; CONFIG is only a fallback for pre-existing jobs.
+        ua = job.get('user_agent') or CONFIG.get('user_agent') or 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
 
         cmd = [
             rclone_executable, 'copyurl',

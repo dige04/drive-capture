@@ -231,7 +231,8 @@ function sendResult(fileId, url, error, urls) {
         file_id: fileId,
         url: url,
         error: error,
-        urls: urls
+        urls: urls,
+        user_agent: navigator.userAgent
     });
 }
 

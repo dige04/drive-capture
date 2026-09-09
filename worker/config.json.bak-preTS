@@ -1,0 +1,9 @@
+{
+  "rclone_remote": "matbit201186",
+  "csv_file": "../data/list2.csv",
+  "max_parallel": 25,
+  "max_captures": 1,
+  "max_pending_transfers": 100,
+  "rclone_path": "/opt/homebrew/bin/rclone",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+}
